@@ -416,6 +416,12 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // A cell that holds no number (NaN) or an infinity (its exponent bits all set) is added up
+    // along every view ray through it, and the upscaler shows a NaN as black (a black sun, black
+    // or white patches). No comparison with a NaN holds, so the cap below let it through: such a
+    // cell is no light. After voidopcode/vilocity bf68945 (GPL-3.0), whose volume also carries
+    // what the air lets through; this one is colour alone.
+    if (any((asuint(c) & 0x7f800000u) == 0x7f800000u)) { scattered[at] = float3(0.0, 0.0, 0.0); return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
