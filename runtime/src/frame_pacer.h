@@ -407,6 +407,7 @@ public:
     // SuspendX: presentation stops, the registration and the frames in flight are dropped, waiters fail.
     void suspend() {
         std::lock_guard guard(mutex_);
+        ++suspend_generation_;
         suspended_ = true;
         interval_set_ = false;
         has_last_present_ = false;  // do not count the suspended pause as a frame interval after resume
@@ -586,13 +587,15 @@ private:
 
     std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t event, std::uint32_t timeout_ms,
                              std::uint32_t flags, std::uint64_t* token) {
+        const auto generation = suspend_generation_;  // resume may re-arm the event before this wait reacquires the lock
         const bool is_origin = (event == frame_event_origin);
         const bool token_on_timeout = (flags & frame_wait_flag_token_on_timeout) != 0;
         const std::uint64_t start = clock_.now_us();
         const std::uint64_t give_up = timeout_ms == infinite_timeout_ms ? no_deadline
                                                                          : start + std::uint64_t(timeout_ms) * 1000;
         for (;;) {
-            if (shutdown_ || suspended_ || !interval_set_) return pacer_hr::invalid_state;
+            if (shutdown_ || suspended_ || !interval_set_ || generation != suspend_generation_)
+                return pacer_hr::invalid_state;
             if (is_origin ? !event_armed_[frame_event_origin]
                           : (!event_armed_[event] && !event_armed_[frame_event_origin])) {
                 return pacer_hr::invalid_state;
@@ -641,6 +644,7 @@ private:
     std::uint32_t waiters_ = 0;
 
     bool suspended_ = false;
+    std::uint64_t suspend_generation_ = 0;
     bool interval_set_ = false;
     bool event_armed_[frame_event_count] = {false, false, false};
     bool uncapped_ = false;

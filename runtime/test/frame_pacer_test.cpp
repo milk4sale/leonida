@@ -60,6 +60,22 @@ bool setup(FramePacer& pacer, std::uint32_t latency, std::uint32_t offset = 0) {
            pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok;
 }
 
+// Run a lifecycle change while the wait has released the pacer mutex, then deliver its wake at the deadline.
+class InterruptedFrameClock final : public FrameClock {
+public:
+    std::function<void()> while_waiting;
+    std::uint64_t now_us() override { return now_; }
+    void wait(std::unique_lock<std::mutex>& lock, std::condition_variable&, std::uint64_t deadline) override {
+        lock.unlock();
+        while_waiting();
+        lock.lock();
+        now_ = deadline;
+    }
+
+private:
+    std::uint64_t now_ = 0;
+};
+
 }  // namespace
 
 int main() {
@@ -597,6 +613,28 @@ int main() {
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 2);
         EXPECT(pacer.check_present_token(2) == pacer_hr::ok);
         EXPECT(pacer.check_present_token(1) == pacer_hr::ok);  // never presented, so not stale
+    }
+
+    // The old wait wakes after a complete suspend, resume and re-registration. The first new tick stays available.
+    for (auto event : {frame_event_origin, frame_event_vblank, frame_event_flip}) {
+        InterruptedFrameClock clock;
+        FramePacer pacer(clock);
+        auto arm = [&] {
+            return pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok &&
+                   pacer.schedule_frame_event(event, 0, 0) == pacer_hr::ok;
+        };
+        EXPECT(arm());
+        bool rearmed = false;
+        clock.while_waiting = [&] {
+            pacer.suspend();
+            pacer.resume();
+            rearmed = arm();
+        };
+        std::uint64_t token = 42;
+        EXPECT(pacer.wait_frame_event(event, 100, 0, &token) == pacer_hr::invalid_state);
+        EXPECT(rearmed && token == 42 && pacer.tokens_issued() == 0);
+        EXPECT(pacer.wait_frame_event(event, 0, 0, &token) == pacer_hr::ok);
+        EXPECT(token == (event == frame_event_origin ? 1u : 42u));
     }
 
     // Destroying a pacer with a blocked waiter lets the waiter go.

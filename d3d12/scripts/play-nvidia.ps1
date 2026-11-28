@@ -102,6 +102,17 @@ if (-not $DryRun -and $Build -eq 'diag' -and (-not (Test-Path $leonida) -or ($ca
     $hasDlss = (Test-Path $built) -and ((Get-Content $built -Raw) -match 'dlss')
 }
 if (-not $DryRun -and -not (Test-Path $leonida)) { Write-Host "No $leonida. Build it first (scripts\build-nvidia.ps1)."; return }
+# Windows 10's own Direct3D 12 stops at shader model 6.5 and refuses every translated pipeline (6.6): there the
+# exe needs Microsoft's newer runtime beside it, which it asks Windows for (apps\leonida\src\agility.rs).
+# Nothing is downloaded here: Get-D3D12.cmd fetches it once.
+$windowsBuild = [int](Get-CimInstance Win32_OperatingSystem).BuildNumber
+$agility = Join-Path (Split-Path $leonida) 'D3D12\D3D12Core.dll'
+if ($windowsBuild -lt 22000 -and -not (Test-Path $agility)) {
+    Write-Host "Windows 10 (build $windowsBuild): its own Direct3D 12 refuses the game's shaders (shader model 6.6)."
+    Write-Host "Get-D3D12.cmd in the d3d12 folder fetches Microsoft's newer runtime (about 22 MB, from nuget.org) into"
+    Write-Host "$(Split-Path $agility); then start this again."
+    if (-not $DryRun) { return }
+}
 # A build nobody noted the making of (cargo by hand) is taken at its word: with DLSS if the files are there.
 # $dlssCan: DLSS can run (its files and a build with it), whoever asks for it: this start, or the F1 menu later.
 $dlssCan = -not $NoDlss -and $DlssDir -and ($hasDlss -or -not (Test-Path $built))

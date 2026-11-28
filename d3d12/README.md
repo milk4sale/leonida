@@ -361,6 +361,16 @@ scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
 The first start builds the layer by itself (`scripts\build-nvidia.ps1`: the
 `diag` profile with `diagnostics`).
 
+**On Windows 10, run `Get-D3D12.cmd` once.** Windows 10's own Direct3D 12 stops
+at shader model 6.5 and refuses every translated pipeline. `Get-D3D12.cmd`
+downloads Microsoft's newer runtime (the D3D12 Agility SDK 1.614.1, about 22
+MB, from nuget.org, checked against its SHA-256 and Microsoft's signature) into
+`target\diag\D3D12\`, and `leonida.exe` asks Windows for it
+(`apps\leonida\src\agility.rs`: it exports `D3D12SDKVersion`, set to the version
+of the `D3D12Core.dll` there, and `D3D12SDKPath`). Windows 11 needs nothing:
+where no such folder is there, the exe asks for Windows' own runtime.
+`scripts\play-nvidia.ps1` stops with this hint on Windows 10 without the folder.
+
 **For DLSS and DLSS frame generation, run `Get-NVIDIA-DLSS.cmd` once** (double
 click it, or `Get-NVIDIA-DLSS.cmd -NoStreamline` for DLSS alone). It downloads
 the few NVIDIA files they need, about 70 MB, from NVIDIA's own GitHub

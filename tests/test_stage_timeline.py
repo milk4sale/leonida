@@ -11,7 +11,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -22,25 +21,27 @@ if TOOLS not in sys.path:
 import stage_timeline  # noqa: E402
 
 
+RVA_ARGS = ("--game-state-rva", "1a", "--session-state-rva", "2b", "--load-state-rva", "3c")
+
+
 class StageTimelineTests(unittest.TestCase):
     def test_parses_boot_timeline_and_pairs_presses_json(self):
         log = "\n".join([
-            "[rt] peek t=1s: 0x7446510=2,0 0x98f828c=1,0 0x7453ed0=0,0",
-            "[rt] peek t=3s: 0x7446510=3,0 0x98f828c=1,0 0x7453ed0=0,0",
+            "[rt] peek t=1s: 0x1a=2,0 0x2b=1,0 0x3c=0,0",
+            "[rt] peek t=3s: 0x1a=3,0 0x2b=1,0 0x3c=0,0",
             "[rt] gameinput: scripted press of button 1 at 4.0 s",
-            "[rt] peek t=5s: 0x7446510=3,0 0x98f828c=3,0 0x7453ed0=0,0",
+            "[rt] peek t=5s: 0x1a=3,0 0x2b=3,0 0x3c=0,0",
             "[rt] gameinput: scripted press of button 1 at 6.5 s",
-            "[rt] peek t=8s: 0x7446510=3,0 0x98f828c=0,0 0x7453ed0=2,0",
-            "[rt] peek t=10s: 0x7446510=3,0 0x98f828c=0,0 0x7453ed0=0,0",
+            "[rt] peek t=8s: 0x1a=3,0 0x2b=0,0 0x3c=2,0",
+            "[rt] peek t=10s: 0x1a=3,0 0x2b=0,0 0x3c=0,0",
         ]) + "\n"
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "boot.log")
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(log)
             out = io.StringIO()
-            with mock.patch.object(sys, "argv", ["stage_timeline.py", path, "--json"]), \
-                    contextlib.redirect_stdout(out):
-                rc = stage_timeline.main()
+            with contextlib.redirect_stdout(out):
+                rc = stage_timeline.main([path, "--json", *RVA_ARGS])
         self.assertEqual(rc, 0)
         doc = json.loads(out.getvalue())
         self.assertEqual(doc["stages"], [
@@ -63,7 +64,7 @@ class StageTimelineTests(unittest.TestCase):
 
     def test_malformed_press_timestamp_does_not_crash_read(self):
         log = "\n".join([
-            "[rt] peek t=2s: 0x7446510=3,0 0x98f828c=1,0",
+            "[rt] peek t=2s: 0x1a=3,0 0x2b=1,0",
             "[rt] gameinput: scripted press of button 1 at . s",
             "[rt] gameinput: scripted press of button 1 at 1.2.3 s",
             "[rt] gameinput: scripted press of button 2 at 3 s",
@@ -72,7 +73,7 @@ class StageTimelineTests(unittest.TestCase):
             path = os.path.join(tmp, "boot.log")
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(log)
-            peeks, presses = stage_timeline.read(path)
+            peeks, presses = stage_timeline.read(path, 0x1a, 0x2b, 0x3c)
         self.assertEqual(len(peeks), 1)
         self.assertEqual(presses, [{"t": 3.0, "button": 2}])
 
@@ -93,8 +94,8 @@ class StageTimelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "bom.log")
             with open(path, "w", encoding="utf-8-sig", newline="\n") as f:
-                f.write("[rt] peek t=1s: 0x7446510=2,0 0x98f828c=1,0\n")
-            peeks, _ = stage_timeline.read(path)
+                f.write("[rt] peek t=1s: 0x1a=2,0 0x2b=1,0\n")
+            peeks, _ = stage_timeline.read(path, 0x1a, 0x2b, 0x3c)
         self.assertEqual(len(peeks), 1)
         self.assertEqual(peeks[0]["game"], 2)
 
@@ -104,17 +105,17 @@ class StageTimelineTests(unittest.TestCase):
             for target in (missing, tmp):
                 with self.subTest(target=target):
                     p = subprocess.run(
-                        [sys.executable, "-I", TOOL, target],
+                        [sys.executable, "-I", TOOL, target, *RVA_ARGS],
                         capture_output=True, encoding="utf-8", errors="replace",
                     )
                     self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                     self.assertNotIn("Traceback", p.stderr)
-                    self.assertTrue(p.stderr.strip())
+                    self.assertIn(target, p.stderr)
                     err = io.StringIO()
-                    with mock.patch.object(sys, "argv", ["stage_timeline.py", target]), \
-                            contextlib.redirect_stderr(err):
-                        rc = stage_timeline.main()
+                    with contextlib.redirect_stderr(err):
+                        rc = stage_timeline.main([target, *RVA_ARGS])
                     self.assertEqual(rc, 2)
+                    self.assertIn(target, err.getvalue())
 
     def test_main_block_guards_stdout_reconfigure(self):
         with open(TOOL, encoding="utf-8") as f:

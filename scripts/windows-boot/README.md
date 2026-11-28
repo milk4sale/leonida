@@ -86,6 +86,10 @@ session=?`. A `LEONIDA_PEEK` of your own still works for the log, but the digest
 variables name. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
 
+To pair scripted presses with state changes after a run, use `python -I tools/stage_timeline.py LOG` with the same
+two environment variables. For a saved log, `--game-state-rva` and `--session-state-rva` override them. If the log
+also records the loading-screen state, pass its hex RVA with `--load-state-rva` to see when the screen ended.
+
 ## One game at a time
 
 The script holds the named mutex `Local\LeonidaGameBoot` for the whole boot and also waits while any `gta6rt.exe`

@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 mod leonida;
@@ -179,6 +180,10 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // Which Direct3D 12 runtime Windows loads (the Agility SDK beside the exe, or its own),
+    // before anything uses Direct3D 12: it reads the version then.
+    #[cfg(windows)]
+    agility::match_d3d12_core();
     // Leonida's settings names (LEONIDA_X for LEONIDA_X), before any thread starts.
     leonida::apply_settings_names();
     leonida_core::logging::init("info");

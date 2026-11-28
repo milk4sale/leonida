@@ -85,6 +85,7 @@ constexpr size_t kHistoryCap = 512;       // readings per pad, whatever the poll
 constexpr float kMaxAcceleration = 19.6133f;     // 2 g in m/s^2
 constexpr float kMaxAngularVelocity = 34.9066f;  // 2000 deg/s in rad/s
 constexpr float kMotionSensorRate = 250.0f;      // requested sample rate; the device clamps to what it has
+constexpr uint64_t kSlowReaderUs = 50'000;  // a title reading a pad less often than this gets presses it would miss
 constexpr uint64_t kMotionReadingUs = 8'000;     // a motion pad streams readings at ~125 Hz so the history stays sane
 
 uint64_t now_us() {
@@ -539,6 +540,9 @@ public:
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
+    Reading* missed = nullptr;     // one reference: a press since the title's last GetCurrentReading here
+    uint32_t read_buttons = 0;     // the buttons that call answered, and when
+    uint64_t read_us = 0;
     Reading* latest() const { return history.empty() ? nullptr : history.back(); }
     uint64_t seq = 0;
     Rumble wanted;
@@ -1271,6 +1275,11 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     std::deque<Reading*>& h = d->history;
     d->last_reading_us = ts;
     h.push_back(new Reading(d, snap, ++d->seq, ts, ++g().last_order));
+    if (d->read_us && (snap.gamepad.buttons & ~d->read_buttons)) {
+        if (d->missed) d->missed->Release();
+        d->missed = h.back();
+        d->missed->AddRef();
+    }
     while (h.size() > kHistoryCap || (h.size() > 1 && h[1]->GetTimestamp() + kHistoryUs < ts)) {
         d->evicted_order = h.front()->order();
         h.front()->Release();
@@ -1531,6 +1540,10 @@ void close_pad(Device* d, uint64_t ts) {
     if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
     for (Reading* r : d->history) r->Release();
     d->history.clear();
+    if (d->missed) d->missed->Release();
+    d->missed = nullptr;
+    d->read_buttons = 0;
+    d->read_us = 0;
     s.connected.erase(std::remove(s.connected.begin(), s.connected.end(), d), s.connected.end());
     queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
     std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
@@ -2641,6 +2654,25 @@ public:
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
                     return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
                 best = d->latest();
+                // A title that reads a pad once a frame, at a few frames a second, would never see a press that came and
+                // went between two reads: it gets the press once, the pad's real state on the next read.
+                GameInputGamepadState now_state{}, press{};
+                if (best) best->GetGamepadState(&now_state);
+                const uint64_t now = now_us();
+                if (best && d->missed && now - d->read_us > kSlowReaderUs && d->missed->GetGamepadState(&press) &&
+                    (press.buttons & ~now_state.buttons)) {
+                    best = d->missed;
+                    now_state = press;
+                }
+                d->read_buttons = now_state.buttons;
+                d->read_us = now;
+                if (best) {
+                    best->AddRef();
+                    *out = best;
+                }
+                if (d->missed) d->missed->Release();
+                d->missed = nullptr;
+                return *out ? S_OK : GAMEINPUT_E_READING_NOT_FOUND;
             }
         } else {
             for (Device* d : g().connected)  // the most recent reading from any gamepad

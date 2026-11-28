@@ -2379,6 +2379,52 @@ int main(int argc, char** argv) {
     release_all(seen);
     if (pair_ref) pair_ref->Release();
 
+    // A slow reader: a press that came and went between two reads of a pad is answered once, then the real state.
+    // Sleeps are 150 ms, three times kSlowReaderUs (50 ms), so a loaded CI machine cannot make the reader look fast.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    Sleep(150);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    {
+        IGameInputReading* first = current(input, dev);
+        IGameInputReading* second = current(input, dev);
+        check(first && second && (buttons_of(first) & GameInputGamepadX) && !(buttons_of(second) & GameInputGamepadX),
+              "a slow reader sees a missed press once");
+        if (first) first->Release();
+        if (second) second->Release();
+    }
+
+    // Two slow-read pads: each one's missed press comes back on its own pad only.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    if (IGameInputReading* r = current(input, dsdev)) r->Release();
+    Sleep(150);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_NORTH, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_NORTH, false);
+    rt::gameinput::poll();
+    {
+        IGameInputReading* ds_first = current(input, dsdev);
+        IGameInputReading* x_first = current(input, dev);
+        IGameInputReading* ds_second = current(input, dsdev);
+        IGameInputReading* x_second = current(input, dev);
+        check(ds_first && device_of(ds_first) == dsdev && (buttons_of(ds_first) & GameInputGamepadY) &&
+                  !(buttons_of(ds_first) & GameInputGamepadX),
+              "two slow-read pads: the DualSense gets its own missed press, not the Xbox pad's");
+        check(x_first && device_of(x_first) == dev && (buttons_of(x_first) & GameInputGamepadX) &&
+                  !(buttons_of(x_first) & GameInputGamepadY),
+              "two slow-read pads: the Xbox pad gets its own missed press, not the DualSense's");
+        check(ds_second && x_second && !(buttons_of(ds_second) & GameInputGamepadY) && !(buttons_of(x_second) & GameInputGamepadX),
+              "two slow-read pads: each missed press comes once");
+        for (IGameInputReading* r : {ds_first, x_first, ds_second, x_second})
+            if (r) r->Release();
+    }
+
     // Ageing: a reading leaves the history once the reading after it is more than half a second old.
     IGameInputReading* aged = current(input, dev);
     SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
@@ -2427,6 +2473,25 @@ int main(int argc, char** argv) {
     if (reconnect) reconnect->Release();
     check(idle && aged && fresh && idle->Release() == 0 && aged->Release() == 0 && fresh->Release() == 0,
           "history: dropped readings are freed once the title releases them");
+
+    // Unplugging drops a pending missed press: the first slow read after replugging is the pad's real state.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    Sleep(150);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    detach(xbox2);
+    rt::gameinput::poll();
+    attach(xbox2, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    Sleep(150);
+    {
+        IGameInputReading* after = current(input, dev);
+        check(after && device_of(after) == dev && !(buttons_of(after) & GameInputGamepadX),
+              "close_pad drops a pending missed press: no stale press after replugging");
+        if (after) after->Release();
+    }
 
     if (reading) reading->Release();
     dev->Release();

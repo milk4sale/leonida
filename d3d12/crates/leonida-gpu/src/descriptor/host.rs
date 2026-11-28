@@ -6612,6 +6612,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         };
         let memory = vec![0u64; 1 << 13];
         let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // Give every placed view the same backing buffer. A loose-memory
+        // window has its own origin, so start + 456 need not be on one of
+        // its 456-byte elements.
+        struct Backing(u64);
+        impl Drop for Backing {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0 as usize, self.0);
+            }
+        }
+        crate::shadow::register(start as usize, start, 4096);
+        let _backing = Backing(start);
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
