@@ -2227,6 +2227,31 @@ mod tests {
         assert_ne!(words(at), words(other.as_ptr() as u64));
     }
 
+    /// A placed view's resource description is keyed without its two padding words (1, after
+    /// the dimension and before the 64-bit alignment; 13, after the flags: the 56 bytes of
+    /// `D3D12_RESOURCE_DESC`) and with every field: descriptions that differ in the padding
+    /// alone are one key, descriptions that differ in a field are two (`normal_placed`). The
+    /// key of naixue2233/Yuk1-nvdia-gta6 67a30b2 (GPL-3.0; MystifiedSky/VIctory-NVIDIA-Improved
+    /// 4eead67, pull request 58), the same words this tree already left out.
+    #[test]
+    fn placed_keys_leave_out_the_padding_and_keep_every_field() {
+        let view = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x7775_0000, 0xd, 0, 0, 0, 0];
+        let texture = |pad: [u32; 2]| -> [u32; 14] { [3, pad[0], 0, 0, 8, 0, 8, 0x1_0001, 28, 1, 0, 0, 0, pad[1]] };
+        for unordered in [false, true] {
+            let key = |resource| normal_placed(unordered, resource, view);
+            let plain = key(texture([0, 0]));
+            assert_eq!(key(texture([0xaaaa_aaaa, 0xbbbb_bbbb])), plain, "the padding is no field");
+            assert_eq!(key(texture([0x1234_5678, 0])), plain);
+            assert_eq!(key(texture([0, 0x1234_5678])), plain);
+            // dimension, alignment, width, height, depth and levels, format, samples, layout, flags
+            for word in [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+                let mut other = texture([0, 0]);
+                other[word] ^= 0x10;
+                assert_ne!(key(other), plain, "word {word} is a field");
+            }
+        }
+    }
+
     /// Placed views that differ only in words no view reads (the resource description's
     /// padding, a shader resource view's padding word, the union's words past the member of
     /// the view's dimension) are one shape and one record; a word the view's kind uses still
