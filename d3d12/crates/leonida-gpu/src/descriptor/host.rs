@@ -1435,6 +1435,104 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a dynamic raw view ([`HostHeap::raw_at`], [`HostHeap::raw_uav_at`]) is kept
+/// inside the buffer it views ([`raw_range`]). On by default; `LEONIDA_RAW_VIEW_CLAMP=0`
+/// makes it from the range asked for, as before (what would have been cut is still
+/// counted).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// How a dynamic raw view's range was cut to its buffer ([`raw_range`]); the index of its
+/// counter in [`RAW_CUTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawCut {
+    /// It begins where no whole dword of the buffer is left: a null view.
+    Past = 0,
+    /// It runs past the buffer's end (or past `u32::MAX` dwords): the dwords that fit.
+    Shortened = 1,
+    /// Under a dword asked for: one, as before.
+    Short = 2,
+    /// It does not begin on 16 bytes, as a raw view must: a null view.
+    Unaligned = 3,
+}
+
+/// Dynamic raw views cut to their buffer since the start ([`raw_range`]), shader then
+/// unordered ones, by [`RawCut`]; with `LEONIDA_RAW_VIEW_CLAMP=0` those that would have
+/// been.
+pub(crate) static RAW_CUTS: [[std::sync::atomic::AtomicU64; 4]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 2];
+
+/// A raw view of `len` bytes from byte `offset` of a buffer of `width` bytes, as the host
+/// takes it: its first dword and its dwords, kept inside the buffer, or none (a null view)
+/// when it begins where no whole dword is left or off the 16 bytes a raw view begins on;
+/// and how it was cut, if it was. A view's reads past its buffer's end reach whatever the
+/// driver placed after it, and a dynamic raw view was made from the range the title asked
+/// for without asking the buffer (the raw twins of heap views were already cut,
+/// [`twin_window`]). Under a dword asked for still reads one, as before.
+///
+/// From naixue2233/Yuk1-nvdia-gta6 34452a2 (GPL-3.0), which has it from
+/// MystifiedSky/VIctory-NVIDIA-Improved aec85ef, itself fxceless/victory-fork pull request
+/// 1266 (lichenlang89, dd5e8c9e): there it took away a violet patch on lit floors and
+/// streaks across white frames (light and instance data read as colours).
+fn raw_range(width: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<RawCut>) {
+    if !offset.is_multiple_of(16) {
+        return (None, Some(RawCut::Unaligned));
+    }
+    let (first, words) = (offset / 4, width / 4);
+    if first >= words {
+        return (None, Some(RawCut::Past));
+    }
+    let asked = (len / 4).max(1);
+    let dwords = asked.min(words - first).min(u64::from(u32::MAX));
+    let cut = if dwords < asked {
+        Some(RawCut::Shortened)
+    } else if len < 4 {
+        Some(RawCut::Short)
+    } else {
+        None
+    };
+    (Some((first, dwords as u32)), cut)
+}
+
+/// [`raw_range`] of `buffer`, counted in `RAW_CUTS[which]` (0 shader, 1 unordered), or the
+/// range as asked for with `LEONIDA_RAW_VIEW_CLAMP=0`.
+fn raw_view_range(buffer: &ID3D12Resource, offset: u64, len: u64, which: usize) -> Option<(u64, u32)> {
+    // SAFETY: a live buffer.
+    let width = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(width, offset, len);
+    if let Some(cut) = cut {
+        RAW_CUTS[which][cut as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if raw_view_clamp() {
+        range
+    } else {
+        Some((offset / 4, (len / 4).clamp(1, u64::from(u32::MAX)) as u32))
+    }
+}
+
+/// [`RAW_CUTS`] for the frame line.
+pub(crate) fn raw_cuts_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [srv, uav] = RAW_CUTS.each_ref().map(|cuts| cuts.each_ref().map(|n| n.load(Relaxed)));
+    format!(
+        "dynamic raw views cut to their buffer so far (LEONIDA_RAW_VIEW_CLAMP=0: counted, not cut): shader {} \
+         ({} begun past its end, null; {} shortened; {} under a dword; {} off 16 bytes, null), unordered {} \
+         ({} past, {} shortened, {} under a dword, {} off 16 bytes)",
+        srv.iter().sum::<u64>(),
+        srv[0],
+        srv[1],
+        srv[2],
+        srv[3],
+        uav.iter().sum::<u64>(),
+        uav[0],
+        uav[1],
+        uav[2],
+        uav[3]
+    )
+}
+
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -3515,17 +3613,21 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
     /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
-    /// the host placed after the buffer.
+    /// the host placed after the buffer. Kept inside the buffer, or null
+    /// when nothing of it is ([`raw_range`]).
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some((first, elements)) = raw_view_range(buffer, offset, len, 0) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
@@ -3557,16 +3659,20 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// `len` bytes of `buffer` from byte `offset` (a multiple of 16): a
     /// root UAV with a size, whose accesses past it do nothing instead of
-    /// reaching whatever the host placed after the buffer.
+    /// reaching whatever the host placed after the buffer. Kept inside the
+    /// buffer, or null when nothing of it is ([`raw_range`]).
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let Some((first, elements)) = raw_view_range(buffer, offset, len, 1) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
+                    FirstElement: first,
                     NumElements: elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
@@ -6357,6 +6463,34 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
         assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    /// A dynamic raw view stays inside its buffer: a range inside it is left
+    /// as it is, one over its end keeps the dwords that fit, one wholly past
+    /// it and one off the 16 bytes a raw view begins on are null views.
+    #[test]
+    fn raw_views_are_cut_to_their_buffer() {
+        // inside: 16 dwords from dword 4 of a buffer of 128 bytes
+        assert_eq!(raw_range(128, 16, 64), (Some((4, 16)), None));
+        // to the end exactly
+        assert_eq!(raw_range(128, 64, 64), (Some((16, 16)), None));
+        // over the end: the 4 dwords from byte 112 on
+        assert_eq!(raw_range(128, 112, 64), (Some((28, 4)), Some(RawCut::Shortened)));
+        // a buffer whose width is not whole dwords: the last bytes are no dword
+        assert_eq!(raw_range(126, 112, 64), (Some((28, 3)), Some(RawCut::Shortened)));
+        // wholly past it, and from its end on
+        assert_eq!(raw_range(128, 256, 16), (None, Some(RawCut::Past)));
+        assert_eq!(raw_range(128, 128, 16), (None, Some(RawCut::Past)));
+        // under a dword: one, as before; none when no dword is left
+        assert_eq!(raw_range(128, 0, 2), (Some((0, 1)), Some(RawCut::Short)));
+        assert_eq!(raw_range(2, 0, 2), (None, Some(RawCut::Past)));
+        // not on 16 bytes (dword-aligned or not): null
+        assert_eq!(raw_range(128, 8, 16), (None, Some(RawCut::Unaligned)));
+        assert_eq!(raw_range(128, 6, 16), (None, Some(RawCut::Unaligned)));
+        // a length that is not whole dwords: the whole dwords of it
+        assert_eq!(raw_range(128, 0, 10), (Some((0, 2)), None));
+        // more dwords than a view can count, of a buffer that has them
+        assert_eq!(raw_range(1 << 36, 0, 1 << 35), (Some((0, u32::MAX)), Some(RawCut::Shortened)));
     }
 
     /// What a slot is made as is made beside the heap and copied in whole: the
